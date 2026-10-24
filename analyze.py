@@ -8,6 +8,7 @@
     output/採購分析報告.html   (原 Node 2 的輸出)
 """
 import argparse
+import calendar
 import json
 import math
 import re
@@ -18,13 +19,24 @@ from pathlib import Path
 
 import pandas as pd
 
+import codebook
+
 # ===== 設定 =====
 YEARS = [2025, 2026]       # [基準年, 比較年]
 MONTH_FROM, MONTH_TO = 1, 12  # 只分析這個月份區間 (兩個年度都套用)
+DATA_END = None            # 資料中最晚的採購日期 (YYYY-MM-DD), 由 run() 設定; 用來判斷最新月份是否滿月
 VOLUME_METRIC = 'lines'    # 'lines' 行數 | 'amount' 採購未稅金額 | 'qty' 分批採購數量
 MOM_THRESHOLD = 0.3        # 月對月波動率異常門檻
-TOP_SUPPLIERS = 5
-TOP_GROWTH = 3
+TOP_GROWTH = 5             # 下單量增加量最高的前 N 名產品線
+TOP_BRAND_GROWTH = 5       # 廠牌 YoY/QoQ/MoM 每個第一碼列出前 N 個廠牌 (依當期金額), 其餘合併為「其他已識別廠牌」
+TOP_DELIVERY_BRANDS = 5    # 廠牌達交率每個第一碼列出前 N 個廠牌 (依筆數)
+TOP_BUYER_ITEMS = 5        # 各採購人員達交率: 每位採購人員、每個第一碼列出前 N 個品項 (依筆數)
+# 採購人員調整 (下單量與達交率的資料): BUYER_RENAMES 為「原採購人員 → 改算給誰」(併入後一起計算),
+# BUYERS_EXCLUDED 為整個排除的採購人員 (不計入下單量與達交率相關分析; 毛利率分析仍使用全部明細)
+BUYER_RENAMES = {'劉孟丞': '林俐廷', '張庭嘉': '郭庭毓', '吳婉瑜': '蔡沂錞'}
+BUYERS_EXCLUDED = {'tiptop', '李佳玟', '簡瑋萱'}
+# 採購未到貨代號為這些原因者標記為「資料例外」, 不計入達交率分母 (代號格式「原因-(責任方)」)
+DELIVERY_EXCEPTIONS = {'資料不齊': '業務', '訂單暫停': '業務', '客戶因素': '客戶', '其他原因': '其他', '倉庫未收': '倉庫'}
 LOWEST_MARGIN_N = 3
 
 
@@ -87,6 +99,20 @@ def txt(v, default):
     return s if s else default
 
 
+def adjust_buyer(raw):
+    """回傳 (調整後的採購人員, 是否排除): 先套用 BUYER_RENAMES 再判斷 BUYERS_EXCLUDED (不分大小寫)"""
+    name = txt(raw, '(未知)').strip()
+    name = BUYER_RENAMES.get(name, name)
+    return name, name.lower() in {b.lower() for b in BUYERS_EXCLUDED}
+
+
+def delivery_exception(code):
+    """採購未到貨代號屬於「資料例外」原因時回傳標準寫法 (例「資料不齊-(業務)」), 否則 None"""
+    m = re.match(r'\s*([^\-－(（\s]+)', code or '')
+    name = m.group(1) if m else ''
+    return f'{name}-({DELIVERY_EXCEPTIONS[name]})' if name in DELIVERY_EXCEPTIONS else None
+
+
 # ===== 讀取 (只留「已確認」, 年度/月份在 analyze 篩選) =====
 def load_records(path):
     if str(path).lower().endswith('.csv'):
@@ -94,10 +120,27 @@ def load_records(path):
     else:
         df = pd.read_excel(path, dtype=str).astype(object)
     df = df.where(lambda d: d.notna(), None)  # NaN → None
+    cls = codebook.Classifier()
     recs = []
     for r in df.to_dict('records'):
         if str(r.get('狀態') or '').strip() != '已確認':
             continue
+        pn, pname = str(r.get('料件編號') or '').strip(), txt(r.get('品名'), '(未知)')
+        supplier = txt(r.get('採購供應商'), '(未知)')
+        cat_name, sub_name = txt(r.get('類別名稱'), ''), txt(r.get('子類別名稱'), '')
+        # 指定供應商 (SUPPLIER_LINES) 依供應商各歸成一個品項 / 產品線;
+        # 第一碼 T、採購供應商屬 HW_MAINT_SUPPLIERS 且子類別名稱空白者歸為「硬體維護」;
+        # 其餘依 品名 → 子類別名稱 → 類別名稱 辨識
+        if codebook.supplier_line(supplier):
+            item = codebook.supplier_line(supplier)
+        elif pn[:1].upper() == 'T' and not sub_name and codebook.is_hw_maint_supplier(supplier):
+            item = codebook.HW_MAINT_LABEL
+        else:
+            item = cls.item(pn, pname, cat_name, sub_name)
+        buyer, drop_buyer = adjust_buyer(r.get('採購人員'))
+        brand = cls.brand(pn, pname, cat_name, sub_name)
+        if brand == codebook.UNKNOWN_BRAND:  # 廠牌辨識不出時, 指定供應商 (SUPPLIER_BRANDS) 直接以其廠牌名稱取代空值
+            brand = codebook.supplier_brand(supplier) or brand
         d = parse_date(r.get('採購日期'))
         d = datetime.fromtimestamp(d * 86400, tz=timezone.utc) if d is not None else None
         std, ven = parse_date(r.get('標準交貨日期')), parse_date(r.get('廠商交貨日期'))
@@ -106,38 +149,47 @@ def load_records(path):
         recs.append({
             'year': d.year if d else None, 'month': d.month if d else None,
             'idx': d.year * 12 + d.month - 1 if d else None,
+            'ymd': d.strftime('%Y-%m-%d') if d else None,
             'sYear': sd.year if sd else None, 'sMonth': sd.month if sd else None,
             'sIdx': sd.year * 12 + sd.month - 1 if sd else None,
-            'cat': (str(r.get('料件編號') or '').strip()[:1].upper() or '?'),
-            'supplier': txt(r.get('採購供應商'), '(未知)'),
-            'buyer': txt(r.get('採購人員'), '(未知)'),
-            'name': txt(r.get('品名'), '(未知)'),
+            'item': item,
+            'cat': (pn[:1].upper() or '?'),
+            'line': item,  # 產品線與品項用同一套歸類 (含指定供應商規則)
+            'brand': brand,
+            'supplier': supplier,
+            'buyer': buyer,
+            'dropBuyer': drop_buyer,
+            'name': pname,
             'qty': num(r.get('分批採購數量')),
             'cost': num(r.get('採購未稅金額')),
             'sales': num(r.get('銷售金額(未稅)')),
             'diffDays': diff,
             'onTime': None if diff is None else diff >= 0,
+            'exc': delivery_exception(txt(r.get('採購未到貨代號'), '')),
         })
     return recs
 
 
 # ===== Node 1: 分析 =====
-def analyze(all_recs):
+def analyze(all_recs_full):
     # 下單量/毛利率以採購日期歸屬
-    recs = [r for r in all_recs
-            if r['year'] in YEARS and MONTH_FROM <= r['month'] <= MONTH_TO]
-    for r in recs:
+    # recs_m: 全部明細 (毛利率分析用); all_recs / recs: 排除 BUYERS_EXCLUDED 後 (下單量與達交率分析用)
+    all_recs = [r for r in all_recs_full if not r['dropBuyer']]
+    recs_m = [r for r in all_recs_full
+              if r['year'] in YEARS and MONTH_FROM <= r['month'] <= MONTH_TO]
+    for r in recs_m:
         r['vol'] = r['cost'] if VOLUME_METRIC == 'amount' else r['qty'] if VOLUME_METRIC == 'qty' else 1
+    recs = [r for r in recs_m if not r['dropBuyer']]
     if not recs:
         return {'error': '沒有符合條件(狀態=已確認且採購日期在指定年度)的資料'}
 
     Y0, Y1 = YEARS
-    min_idx, max_idx = min(r['idx'] for r in recs), max(r['idx'] for r in recs)
+    min_idx, max_idx = min(r['idx'] for r in recs_m), max(r['idx'] for r in recs_m)
     all_idx = list(range(min_idx, max_idx + 1))
     # 同期比較: 比較年只有到 cutoff 月, 基準年也只取到同一個月
     y1_months = [r['month'] for r in recs if r['year'] == Y1]
     cutoff = max(y1_months) if y1_months else 12
-    by_idx_all = group_by(recs, lambda r: r['idx'])
+    by_idx_all = group_by(recs_m, lambda r: r['idx'])
 
     def month_series(arr, val_fn):
         by_idx = group_by(arr, lambda r: r['idx'])
@@ -152,15 +204,22 @@ def analyze(all_recs):
         return out
 
     # --- 1. 每月下單量 ---
-    monthly_volume = []
-    for m in range(1, 13):
-        a = sum(r['vol'] for r in recs if r['year'] == Y0 and r['month'] == m)
-        b = sum(r['vol'] for r in recs if r['year'] == Y1 and r['month'] == m)
-        ca = sum(r['cost'] for r in recs if r['year'] == Y0 and r['month'] == m)
-        cb = sum(r['cost'] for r in recs if r['year'] == Y1 and r['month'] == m)
-        monthly_volume.append({'month': m, Y0: r2(a), Y1: r2(b), 'yoyPct': pct((b - a) / a) if a > 0 else None,
-                               f'cost{Y0}': r2(ca), f'cost{Y1}': r2(cb),
-                               'costYoyPct': pct((cb - ca) / ca) if ca > 0 else None})
+    def monthly_of(arr):
+        rows = []
+        for m in range(1, 13):
+            a = sum(r['vol'] for r in arr if r['year'] == Y0 and r['month'] == m)
+            b = sum(r['vol'] for r in arr if r['year'] == Y1 and r['month'] == m)
+            ca = sum(r['cost'] for r in arr if r['year'] == Y0 and r['month'] == m)
+            cb = sum(r['cost'] for r in arr if r['year'] == Y1 and r['month'] == m)
+            rows.append({'month': m, Y0: r2(a), Y1: r2(b), 'yoyPct': pct((b - a) / a) if a > 0 else None,
+                         f'cost{Y0}': r2(ca), f'cost{Y1}': r2(cb),
+                         'costYoyPct': pct((cb - ca) / ca) if ca > 0 else None})
+        return rows
+
+    monthly_volume = monthly_of(recs)
+    # 依料件編號第一碼區分的逐月下單量 / 採購未稅金額 (同樣的欄位, 每個第一碼一組)
+    monthly_by_cat = [{'category': cat, 'months': monthly_of(arr)}
+                      for cat, arr in group_by(recs, lambda r: r['cat']).items()]
 
     cat_summary = []
     for cat, arr in group_by(recs, lambda r: r['cat']).items():
@@ -180,38 +239,177 @@ def analyze(all_recs):
                             for s in series if s['mom'] is not None and abs(s['mom']) > MOM_THRESHOLD],
         })
 
-    def growth_key(c):
-        if c['growthPct'] is not None:
-            return c['growthPct']
-        return 1e9 if c['isNewCategory'] else -1e9
+    # 每個分析項目都呈現 下單量 與 採購未稅金額 (基準年同期 / 比較年), 占比與增幅由這四個數值算出
+    def measures(arr):
+        in_base = [r for r in arr if r['year'] == Y0 and MONTH_FROM <= r['month'] <= cutoff]
+        cur_arr = [r for r in arr if r['year'] == Y1]
+        return {'volBase': r2(sum(r['vol'] for r in in_base)), 'volCur': r2(sum(r['vol'] for r in cur_arr)),
+                'costBase': r2(sum(r['cost'] for r in in_base)), 'costCur': r2(sum(r['cost'] for r in cur_arr))}
 
-    top3 = [{k: v for k, v in c.items() if k != 'spikeMonths'}
-            for c in sorted(cat_summary, key=lambda c: (-growth_key(c), -c['delta']))[:TOP_GROWTH]]
+    # 產品線下單量增加量排名 (同期比較同上), 依料件編號第一碼分別排名; 每個產品線併列其中占比最高的廠牌
+    def top_brand(arr, base_total, cur_total, field='vol'):
+        """群組內「已識別」廠牌中, 比較年數值 (field: 下單量 vol / 採購未稅金額 cost) 最高者及其占比
+        (占比 = 廠牌數值 ÷ 群組數值); 全部未識別則 None"""
+        best = None
+        for b, a in group_by(arr, lambda r: r['brand']).items():
+            if codebook.is_unclassified(b):
+                continue
+            v0 = sum(r[field] for r in a if r['year'] == Y0 and MONTH_FROM <= r['month'] <= cutoff)
+            v1 = sum(r[field] for r in a if r['year'] == Y1)
+            if v1 > 0 and (best is None or (v1, v0) > (best[2], best[1])):  # 比較年沒有該廠牌的數值就不列
+                best = [b, v0, v1]
+        if best is None:
+            return None
+        s0 = best[1] / base_total if base_total > 0 else None
+        s1 = best[2] / cur_total if cur_total > 0 else None
+        return {'name': best[0], 'basePeriod': r2(best[1]), 'currentPeriod': r2(best[2]),
+                'baseSharePct': pct(s0), 'currentSharePct': pct(s1)}
 
-    # 供應商佔比位移
-    tot0 = sum(r['vol'] for r in recs if r['year'] == Y0)
-    tot1 = sum(r['vol'] for r in recs if r['year'] == Y1)
-    sup_rows = []
-    for s, arr in group_by(recs, lambda r: r['supplier']).items():
-        v0 = sum(r['vol'] for r in arr if r['year'] == Y0)
-        v1 = sum(r['vol'] for r in arr if r['year'] == Y1)
-        s0, s1 = (v0 / tot0 if tot0 > 0 else 0), (v1 / tot1 if tot1 > 0 else 0)
-        sup_rows.append({'supplier': s, f'vol{Y0}': r2(v0), f'vol{Y1}': r2(v1),
-                         f'share{Y0}Pct': pct(s0), f'share{Y1}Pct': pct(s1),
-                         'shiftPP': r2((s1 - s0) * 100), '_t': v0 + v1})
-    sup_rows.sort(key=lambda x: -x['_t'])
-    top_suppliers = [{k: v for k, v in x.items() if k != '_t'} for x in sup_rows[:TOP_SUPPLIERS]]
+    def top_growth():
+        groups = []
+        for cat, cat_arr in group_by(recs, lambda r: r['cat']).items():
+            rows = []
+            for key, arr in group_by(cat_arr, lambda r: r['line']).items():
+                base = sum(r['vol'] for r in arr if r['year'] == Y0 and MONTH_FROM <= r['month'] <= cutoff)
+                cur = sum(r['vol'] for r in arr if r['year'] == Y1)
+                rows.append({'name': key, 'basePeriod': r2(base), 'currentPeriod': r2(cur), 'delta': r2(cur - base),
+                             'growthPct': pct((cur - base) / base) if base > 0 else None,
+                             'isNew': base == 0 and cur > 0, **measures(arr),
+                             'topBrand': None if key in codebook.NO_BRAND_LINES else top_brand(arr, base, cur)})
+            tot1 = sum(x['currentPeriod'] for x in rows)
+            skip = [x for x in rows if codebook.is_unclassified(x['name'])]
+            keep = sorted((x for x in rows if x not in skip), key=lambda x: (-x['delta'], -(x['growthPct'] or 0)))
+            groups.append({'category': cat, 'top': keep[:TOP_GROWTH], 'totals': measures(cat_arr), '_t': tot1,
+                           'excludedSharePct': pct(sum(x['currentPeriod'] for x in skip) / tot1) if tot1 > 0 else None})
+        groups.sort(key=lambda g: -g['_t'])
+        return [{k: v for k, v in g.items() if k != '_t'} for g in groups]
+
+    top_lines = top_growth()
+
+    # 前5大交易品項: 依料件編號第一碼分別; 品項依 品名關鍵字 → 子類別名稱 → 類別名稱 辨識歸類 (見 codebook.item);
+    # 以採購未稅金額加總 (與下單量定義無關), 依比較年金額排序, 基準年取同期
+    def top_items():
+        groups = []
+        for cat, cat_arr in group_by(recs, lambda r: r['cat']).items():
+            rows = []
+            for key, arr in group_by(cat_arr, lambda r: r['item']).items():
+                base = sum(r['cost'] for r in arr if r['year'] == Y0 and MONTH_FROM <= r['month'] <= cutoff)
+                cur = sum(r['cost'] for r in arr if r['year'] == Y1)
+                rows.append({'name': key,
+                             'basePeriod': r2(base), 'currentPeriod': r2(cur), 'delta': r2(cur - base),
+                             'growthPct': pct((cur - base) / base) if base > 0 else None,
+                             'isNew': base == 0 and cur > 0, **measures(arr),
+                             'topBrand': None if key in codebook.NO_BRAND_LINES else top_brand(arr, base, cur, 'cost')})
+            tot1 = sum(x['currentPeriod'] for x in rows)
+            skip = [x for x in rows if codebook.is_unclassified(x['name'])]
+            keep = sorted((x for x in rows if x not in skip), key=lambda x: (-x['currentPeriod'], x['name']))
+            top = keep[:TOP_GROWTH]
+            groups.append({'category': cat, 'top': top, 'totals': measures(cat_arr), '_t': tot1,
+                           'topSharePct': pct(sum(x['currentPeriod'] for x in top) / tot1) if tot1 > 0 else None,
+                           'excludedSharePct': pct(sum(x['currentPeriod'] for x in skip) / tot1) if tot1 > 0 else None})
+        groups.sort(key=lambda g: -g['_t'])
+        return [{k: v for k, v in g.items() if k != '_t'} for g in groups]
+
+    top_amount_items = top_items()
+
+    # 廠牌成長率 YoY / QoQ / MoM: 依料件編號第一碼分別; 廠牌依 品名 → 子類別名稱 → 類別名稱 → 第7-9碼 辨識 (見 codebook.brand);
+    # 以採購未稅金額 (依採購日期歸屬) 加總。以所選區間內比較年「最後一個完整月份」為基準:
+    #   YoY: 比較年 起始月~基準月  vs 去年同期 (基準年同月份)
+    #   QoQ: 最後一個完整季度 vs 上一季
+    #   MoM: 基準月 vs 上個月
+    # QoQ / MoM 會用到區間以外的月份, 所以用全部資料 (all_recs) 計算, 不受月份篩選限制
+    # 基準取「最後一個完整月份」: 資料最新日期 (DATA_END) 還沒到該月月底就退一個月, 避免未滿月造成增率失真
+    partial_idx = None
+    if DATA_END:
+        ey, em, ed = (int(x) for x in DATA_END.split('-'))
+        if ed < calendar.monthrange(ey, em)[1]:
+            partial_idx = ey * 12 + em - 1
+    bg_a0 = Y1 * 12 + cutoff - 1
+    bg_a = bg_a0 - 1 if bg_a0 == partial_idx else bg_a0
+    bg_am = bg_a % 12 + 1
+    bg_qend = bg_a // 12 * 12 + bg_am // 3 * 3 - 1  # 最後一個完整季度的最後一個月
+    bg_start, bg_shift = Y1 * 12 + MONTH_FROM - 1, (Y1 - Y0) * 12
+    bg_win = {'qoq': ((bg_qend - 2, bg_qend), (bg_qend - 5, bg_qend - 3)),
+              'mom': ((bg_a, bg_a), (bg_a - 1, bg_a - 1))}
+    if bg_a >= bg_start:
+        bg_win = {'yoy': ((bg_start, bg_a), (bg_start - bg_shift, bg_a - bg_shift)), **bg_win}
+
+    def q_label(i):
+        return f'{i // 12} Q{i % 12 // 3 + 1}'
+
+    bg_labels = {
+        'yoy': f'{Y1} 年 {MONTH_FROM}~{bg_am} 月 vs {Y0} 年同月份' if 'yoy' in bg_win else None,
+        'qoq': f'{q_label(bg_qend)} vs {q_label(bg_qend - 3)}',
+        'mom': f'{ym_label(bg_a)} vs {ym_label(bg_a - 1)}',
+        'sharePeriod': f'{ym_label(bg_start)} ~ {ym_label(bg_a)}' if bg_a >= bg_start else None,
+        'anchorNote': (f'{ym_label(bg_a0)} 資料尚未滿月（資料最新至 {DATA_END}），以最近完整月份 {ym_label(bg_a)} 為基準'
+                       if bg_a != bg_a0 else '')}
+
+    def vol_of(r):  # 下單量 (依下單量定義)
+        return r['cost'] if VOLUME_METRIC == 'amount' else r['qty'] if VOLUME_METRIC == 'qty' else 1
+
+    def bg_sum(arr, w, f=lambda r: r['cost']):
+        return r2(sum(f(r) for r in arr if r['idx'] is not None and w[0] <= r['idx'] <= w[1]))
+
+    def bg_row(name, arr):
+        row = {'name': name, 'rank': bg_sum(arr, (Y1 * 12 + MONTH_FROM - 1, bg_a)),
+               'volRank': bg_sum(arr, (Y1 * 12 + MONTH_FROM - 1, bg_a), vol_of)}
+        for k in ('yoy', 'qoq', 'mom'):
+            if k in bg_win:
+                c, p0 = bg_sum(arr, bg_win[k][0]), bg_sum(arr, bg_win[k][1])
+                row.update({f'{k}Cur': c, f'{k}Prev': p0, f'{k}Pct': pct((c - p0) / p0) if p0 > 0 else None})
+            else:
+                row.update({f'{k}Cur': None, f'{k}Prev': None, f'{k}Pct': None})
+        # 下單量的 YoY (當期 vs 去年同期), 與金額的 YoY 並列
+        if 'yoy' in bg_win:
+            vc, vp = bg_sum(arr, bg_win['yoy'][0], vol_of), bg_sum(arr, bg_win['yoy'][1], vol_of)
+            row.update({'volYoyPrev': vp, 'volYoyPct': pct((vc - vp) / vp) if vp > 0 else None})
+        else:
+            row.update({'volYoyPrev': None, 'volYoyPct': None})
+        return row
+
+    brand_growth = []
+    for cat in {r['cat'] for r in recs}:
+        arr = [r for r in all_recs if r['cat'] == cat and r['idx'] is not None]
+        by = group_by(arr, lambda r: r['brand'])
+        rows = [bg_row(k, a) for k, a in by.items()]
+        known = sorted((x for x in rows if not codebook.is_unclassified(x['name'])), key=lambda x: (-x['rank'], x['name']))
+        # 只列已識別廠牌中當期金額最大的前 N 個 (不再列「其他」「未識別」彙總列); 「全部」為該第一碼的總計
+        total, top = bg_row('全部', arr), known[:TOP_BRAND_GROWTH]
+        # 當期占比 = 廠牌當期金額 ÷ 該第一碼同期間金額合計 (含未識別廠牌)
+        for x in [total, *top]:
+            x['sharePct'] = pct(x['rank'] / total['rank']) if total['rank'] > 0 else None
+            x['volSharePct'] = pct(x['volRank'] / total['volRank']) if total['volRank'] > 0 else None  # 下單量占比
+        brand_growth.append({'category': cat, 'total': total, 'rows': top})
+    brand_growth.sort(key=lambda g: -g['total']['rank'])
 
     # --- 2. 採購人員達交率 ---
     # 以標準交貨日期的年月歸屬 (與採購日期年度無關)
-    del_recs = [r for r in all_recs if r['onTime'] is not None and r['sYear'] in YEARS
+    # 標準交貨日 − 廠商交貨日 < 0 為不達交; 「資料例外」(採購未到貨代號) 另列, 不計入分母
+    in_scope = [r for r in all_recs if r['onTime'] is not None and r['sYear'] in YEARS
                 and MONTH_FROM <= r['sMonth'] <= MONTH_TO]
+    exc_recs = [r for r in in_scope if r['exc']]
+    del_recs = [r for r in in_scope if not r['exc']]
+    delivery_exceptions = {
+        'total': len(exc_recs),
+        'byReason': [{'reason': k, 'lines': sum(1 for r in exc_recs if r['exc'] == k),
+                      'late': sum(1 for r in exc_recs if r['exc'] == k and not r['onTime'])}
+                     for k in (f'{n}-({d})' for n, d in DELIVERY_EXCEPTIONS.items())],
+    }
 
     def rate(arr):
         return sum(1 for r in arr if r['onTime']) / len(arr) if arr else None
 
-    delivery_by_buyer = []
-    for buyer, arr in group_by(del_recs, lambda r: r['buyer']).items():
+    def split_cost(a, b):
+        """達交 / 未達交 的採購未稅金額 (達交率分母明細, 已排除資料例外) 與各自的同期年增率"""
+        def f(arr, ok):
+            return r2(sum(r['cost'] for r in arr if bool(r['onTime']) == ok))
+        on0, on1, lt0, lt1 = f(a, True), f(b, True), f(a, False), f(b, False)
+        return {f'costOn{Y0}': on0, f'costOn{Y1}': on1, 'costOnYoyPct': pct((on1 - on0) / on0) if on0 > 0 else None,
+                f'costLate{Y0}': lt0, f'costLate{Y1}': lt1, 'costLateYoyPct': pct((lt1 - lt0) / lt0) if lt0 > 0 else None}
+
+    # 逐月、基準年 vs 比較年 (與每月下單量同樣的呈現方式)
+    def delivery_months(arr):
         months = []
         for m in range(1, 13):
             a = [r for r in arr if r['sYear'] == Y0 and r['sMonth'] == m]
@@ -219,10 +417,80 @@ def analyze(all_recs):
             if not a and not b:
                 continue
             ra, rb = rate(a), rate(b)
+            # 達交率分母明細 (已排除資料例外) 的 下單量 / 採購未稅金額 與年增率
+            va, vb = sum(vol_of(r) for r in a), sum(vol_of(r) for r in b)
+            ca, cb = sum(r['cost'] for r in a), sum(r['cost'] for r in b)
             months.append({'month': m, f'rate{Y0}Pct': pct(ra), f'n{Y0}': len(a),
                            f'rate{Y1}Pct': pct(rb), f'n{Y1}': len(b),
-                           'deltaPP': r2((rb - ra) * 100) if ra is not None and rb is not None else None})
-        delivery_by_buyer.append({'buyer': buyer, 'months': months, 'overallPct': pct(rate(arr)), 'lines': len(arr)})
+                           'deltaPP': r2((rb - ra) * 100) if ra is not None and rb is not None else None,
+                           f'vol{Y0}': r2(va), f'vol{Y1}': r2(vb), 'volYoyPct': pct((vb - va) / va) if va > 0 else None,
+                           f'cost{Y0}': r2(ca), f'cost{Y1}': r2(cb), 'costYoyPct': pct((cb - ca) / ca) if ca > 0 else None,
+                           **split_cost(a, b)})
+        return months
+
+    def del_totals(arr):  # 各組合計 (用於占比 = 該組 ÷ 全體)
+        a, b = [r for r in arr if r['sYear'] == Y0], [r for r in arr if r['sYear'] == Y1]
+        return {'vol0': r2(sum(vol_of(r) for r in a)), 'vol1': r2(sum(vol_of(r) for r in b)),
+                'cost0': r2(sum(r['cost'] for r in a)), 'cost1': r2(sum(r['cost'] for r in b))}
+
+    def delivery_by(field, label):
+        return [{label: key, 'months': delivery_months(arr), 'overallPct': pct(rate(arr)), 'lines': len(arr),
+                 'totals': del_totals(arr)}
+                for key, arr in group_by(del_recs, lambda r: r[field]).items()]
+
+    delivery_by_buyer = delivery_by('buyer', 'buyer')
+    delivery_by_category = delivery_by('cat', 'category')  # 料件編號第一碼
+    delivery_overall_yoy = {'months': delivery_months(del_recs), 'overallPct': pct(rate(del_recs)),
+                            'lines': len(del_recs), 'totals': del_totals(del_recs)}
+
+    # 廠牌達交率: 依料件編號第一碼分別; 廠牌依 品名 → 子類別名稱 → 類別名稱 → 第7-9碼 辨識 (見 codebook.brand);
+    # 基準年 / 比較年以標準交貨日期歸屬, 資料例外筆數另列
+    def brand_row(name, arr, exc_arr):
+        a = [r for r in arr if r['sYear'] == Y0]
+        b = [r for r in arr if r['sYear'] == Y1]
+        ra, rb = rate(a), rate(b)
+        va, vb = sum(vol_of(r) for r in a), sum(vol_of(r) for r in b)
+        ca, cb = sum(r['cost'] for r in a), sum(r['cost'] for r in b)
+        return {'name': name, f'n{Y0}': len(a), f'late{Y0}': sum(1 for r in a if not r['onTime']), f'rate{Y0}Pct': pct(ra),
+                f'n{Y1}': len(b), f'late{Y1}': sum(1 for r in b if not r['onTime']), f'rate{Y1}Pct': pct(rb),
+                'deltaPP': r2((rb - ra) * 100) if ra is not None and rb is not None else None,
+                'exceptions': len(exc_arr),
+                f'vol{Y0}': r2(va), f'vol{Y1}': r2(vb), 'volYoyPct': pct((vb - va) / va) if va > 0 else None,
+                f'cost{Y0}': r2(ca), f'cost{Y1}': r2(cb), 'costYoyPct': pct((cb - ca) / ca) if ca > 0 else None,
+                **split_cost(a, b)}
+
+    delivery_by_brand = []
+    for cat in sorted({r['cat'] for r in in_scope}):
+        cat_del = [r for r in del_recs if r['cat'] == cat]
+        cat_exc = [r for r in exc_recs if r['cat'] == cat]
+        exc_by_brand = group_by(cat_exc, lambda r: r['brand'])
+        by_brand = group_by(cat_del, lambda r: r['brand'])
+        known = sorted((k for k in set(by_brand) | set(exc_by_brand) if not codebook.is_unclassified(k)),
+                       key=lambda k: (-len(by_brand.get(k, [])), k))
+        # 只列已識別廠牌中筆數最多的前 N 個 (不再列「其他」「未識別」彙總列); 「全部」為該第一碼的總計
+        rows = [brand_row(k, by_brand.get(k, []), exc_by_brand.get(k, [])) for k in known[:TOP_DELIVERY_BRANDS]]
+        delivery_by_brand.append({'category': cat, 'total': brand_row('全部', cat_del, cat_exc), 'rows': rows})
+    delivery_by_brand.sort(key=lambda g: -(g['total'][f'n{Y0}'] + g['total'][f'n{Y1}']))
+
+    # 各採購人員達交率: 每位採購人員依料件編號第一碼分別, 每個第一碼列出筆數最多的前 N 個品項
+    # (品項依 品名關鍵字 → 子類別名稱 → 類別名稱 → 碼表第4-6碼 歸類, 見 codebook.item; 不分類 / 未歸類不列)
+    delivery_by_buyer_item = []
+    for buyer, arr in group_by(del_recs, lambda r: r['buyer']).items():
+        exc_b = [r for r in exc_recs if r['buyer'] == buyer]
+        cats = []
+        for cat in sorted({r['cat'] for r in arr}):
+            cat_del = [r for r in arr if r['cat'] == cat]
+            cat_exc = [r for r in exc_b if r['cat'] == cat]
+            by_item, exc_by_item = group_by(cat_del, lambda r: r['item']), group_by(cat_exc, lambda r: r['item'])
+            known = sorted((k for k in set(by_item) | set(exc_by_item) if not codebook.is_unclassified(k)),
+                           key=lambda k: (-len(by_item.get(k, [])), k))
+            cats.append({'category': cat, 'total': brand_row('全部', cat_del, cat_exc),
+                         'rows': [brand_row(k, by_item.get(k, []), exc_by_item.get(k, []))
+                                  for k in known[:TOP_BUYER_ITEMS]]})
+        cats.sort(key=lambda g: -(g['total'][f'n{Y0}'] + g['total'][f'n{Y1}']))
+        delivery_by_buyer_item.append({'buyer': buyer, 'overallPct': pct(rate(arr)), 'lines': len(arr),
+                                       'totals': del_totals(arr), 'total': brand_row('全部', arr, exc_b),
+                                       'cats': cats})
 
     del_by_idx = group_by(del_recs, lambda r: r['sIdx'])
     delivery_overall = []
@@ -240,7 +508,8 @@ def analyze(all_recs):
             continue
         s, c = sum(r['sales'] for r in arr), sum(r['cost'] for r in arr)
         profit_monthly.append({'i': i, 'ym': ym_label(i), 'year': i // 12, 'month': i % 12 + 1,
-                               'sales': r2(s), 'cost': r2(c), 'grossProfit': r2(s - c),
+                               'sales': r2(s), 'cost': r2(c), 'vol': r2(sum(r['vol'] for r in arr)),
+                               'grossProfit': r2(s - c),
                                'margin': margin(s, c), 'arr': arr})
 
     def find_pm(y, m):
@@ -252,8 +521,14 @@ def analyze(all_recs):
         if not a and not b:
             continue
         ma, mb = a['margin'] if a else None, b['margin'] if b else None
+        # 同時呈現該月的 下單量 / 採購未稅金額 (= 成本) 與年增率
+        va, vb = a['vol'] if a else 0, b['vol'] if b else 0
+        ca, cb = a['cost'] if a else 0, b['cost'] if b else 0
         margin_yoy.append({'month': m, f'margin{Y0}Pct': pct(ma), f'margin{Y1}Pct': pct(mb),
-                           'deltaPP': r2((mb - ma) * 100) if ma is not None and mb is not None else None})
+                           f'sales{Y0}': a['sales'] if a else 0, f'sales{Y1}': b['sales'] if b else 0,
+                           'deltaPP': r2((mb - ma) * 100) if ma is not None and mb is not None else None,
+                           f'vol{Y0}': va, f'vol{Y1}': vb, 'volYoyPct': pct((vb - va) / va) if va > 0 else None,
+                           f'cost{Y0}': ca, f'cost{Y1}': cb, 'costYoyPct': pct((cb - ca) / ca) if ca > 0 else None})
 
     yearly_summary = []
     for y in YEARS:
@@ -261,7 +536,8 @@ def analyze(all_recs):
         s, c = sum(p['sales'] for p in ms), sum(p['cost'] for p in ms)
         yearly_summary.append({'year': y, 'months': len(ms),
                                'avgMonthlyMarginPct': pct(mean([p['margin'] for p in ms if p['margin'] is not None])),
-                               'aggregateMarginPct': pct(margin(s, c)), 'sales': r2(s), 'cost': r2(c)})
+                               'aggregateMarginPct': pct(margin(s, c)), 'sales': r2(s), 'cost': r2(c),
+                               'vol': r2(sum(p['vol'] for p in ms))})
 
     def agg_name(arr):
         m = {}
@@ -308,7 +584,7 @@ def analyze(all_recs):
 
     # 3.2 最低毛利率品名 → 類別採購成本變動
     name_agg = []
-    for name, arr in group_by(recs, lambda r: r['name']).items():
+    for name, arr in group_by(recs_m, lambda r: r['name']).items():
         s, c = sum(r['sales'] for r in arr), sum(r['cost'] for r in arr)
         mg = margin(s, c)
         if mg is not None:
@@ -335,7 +611,7 @@ def analyze(all_recs):
 
     lowest = [{'name': x['name'], 'marginPct': pct(x['margin']), 'sales': r2(x['sales']), 'cost': r2(x['cost']),
                'categories': x['cats'], 'itemCostTrend': trend(x['arr']),
-               'categoryCostTrend': [{'category': c, 'trend': trend([r for r in recs if r['cat'] == c])}
+               'categoryCostTrend': [{'category': c, 'trend': trend([r for r in recs_m if r['cat'] == c])}
                                      for c in x['cats']]} for x in name_agg]
 
     return {
@@ -345,12 +621,17 @@ def analyze(all_recs):
         'deliveryRecords': len(del_recs),
         'dim1_orderVolume': {
             'monthlyVolume': monthly_volume,
-            'top3CategoryGrowth': top3,
+            'monthlyByCat': monthly_by_cat,
+            'topProductLineGrowth': top_lines,
+            'topAmountItems': top_amount_items,
+            'brandGrowth': {'windows': bg_labels, 'groups': brand_growth},
             'categoryVolatility': cat_summary,
             'volatileCategories': [c['category'] for c in cat_summary if c['volatilityFlag']],
-            'topSuppliers': top_suppliers,
         },
-        'dim2_deliveryRate': {'overallByMonth': delivery_overall, 'byBuyer': delivery_by_buyer},
+        'dim2_deliveryRate': {'overallByMonth': delivery_overall, 'overallYoY': delivery_overall_yoy,
+                              'byBuyer': delivery_by_buyer, 'byCategory': delivery_by_category,
+                              'byBrand': delivery_by_brand, 'byBuyerItem': delivery_by_buyer_item,
+                              'exceptions': delivery_exceptions},
         'dim3_grossMargin': {
             'monthly': [{**{k: v for k, v in p.items() if k not in ('arr', 'i', 'margin')}, 'marginPct': pct(p['margin'])}
                         for p in profit_monthly],
@@ -383,12 +664,18 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}tr:last-child td{borde
 .bar{width:140px;height:8px;border-radius:4px;background:var(--line);overflow:hidden}.bar i{display:block;height:100%;background:var(--b1)}.bar.b0 i{background:var(--b0)}.bar.bneg i{background:var(--neg)}
 details{margin:6px 0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 12px}summary{cursor:pointer;padding:4px 0}
 .note{font-size:12px;color:var(--muted);margin:4px 0 8px}
+td.lown{color:var(--muted);font-style:italic}
+.hlgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;margin:12px 0}
+.hlgrid .card{margin:0}.card ul{margin:4px 0 0;padding-left:18px}.card li{margin:3px 0}.card li ul{margin:2px 0 4px}
 """
 
 
 
 CSS += """
 th.num{text-align:right}
+th.grp{text-align:center}
+td.gs,th.gs{border-left:2px solid var(--line)}
+tr.gt td{border-top:2px solid var(--line)}td.gname{vertical-align:top;border-right:1px solid var(--line)}
 .controls{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 16px;margin:14px 0;position:sticky;top:0;z-index:5}
 .controls select{font:inherit;padding:3px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text)}
 """
@@ -407,7 +694,7 @@ def default_years(recs):
 
 
 def render_html(recs, defaults, generated_at):
-    tabs = {k: {} for k in ('cat', 'sup', 'buy', 'name')}
+    tabs = {k: {} for k in ('cat', 'sup', 'buy', 'name', 'line', 'brand', 'item', 'exc')}
 
     def ix(kind, v):
         return tabs[kind].setdefault(v, len(tabs[kind]))
@@ -417,7 +704,9 @@ def render_html(recs, defaults, generated_at):
 
     rows = [[r['year'] or 0, r['month'] or 0, r['sYear'] or 0, r['sMonth'] or 0,
              ix('cat', r['cat']), ix('sup', r['supplier']), ix('buy', r['buyer']), ix('name', r['name']),
-             cn(r['qty']), cn(r['cost']), cn(r['sales']), -1 if r['onTime'] is None else int(r['onTime'])]
+             cn(r['qty']), cn(r['cost']), cn(r['sales']), -1 if r['onTime'] is None else int(r['onTime']),
+             ix('line', r['line']), ix('brand', r['brand']), ix('item', r['item']),
+             ix('exc', r['exc']) if r['exc'] else -1, 1 if r['dropBuyer'] else 0]
             for r in recs]
     years = sorted({r['year'] for r in recs if r['year']})
     data = {'generatedAt': generated_at, 'years': years, 'defaults': defaults, 'rows': rows,
@@ -436,7 +725,7 @@ def render_html(recs, defaults, generated_at):
 
 def run(input_path, out_dir, years=None, metric=None, months=None, log=print):
     """讀 Excel/CSV → 分析 → 寫出 html + json, 回傳 html 路徑"""
-    global YEARS, VOLUME_METRIC, MONTH_FROM, MONTH_TO
+    global YEARS, VOLUME_METRIC, MONTH_FROM, MONTH_TO, DATA_END
     if metric:
         VOLUME_METRIC = metric
     if months:
@@ -448,6 +737,7 @@ def run(input_path, out_dir, years=None, metric=None, months=None, log=print):
     log(f'讀取 {input_path} ...')
     recs = load_records(input_path)
     YEARS = list(years) if years else default_years(recs)  # 預設: 資料中最近兩年
+    DATA_END = max((r['ymd'] for r in recs if r['ymd']), default=None)  # 資料中最晚的採購日期
     log(f'已確認 {len(recs)} 筆, 分析中 ...')
     result = analyze(recs)
     if 'error' in result:
@@ -455,7 +745,8 @@ def run(input_path, out_dir, years=None, metric=None, months=None, log=print):
     (out / 'analysis.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
     html_path = out / '採購分析報告.html'
     html_path.write_text(render_html(recs, {'y0': YEARS[0], 'y1': YEARS[1], 'mf': MONTH_FROM, 'mt': MONTH_TO,
-                                                   'metric': VOLUME_METRIC}, result['generatedAt']), encoding='utf-8')
+                                                   'metric': VOLUME_METRIC, 'dataEnd': DATA_END}, result['generatedAt']),
+                         encoding='utf-8')
     log(f'完成 → {html_path}')
     return html_path
 
