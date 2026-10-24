@@ -32,4 +32,4 @@ pip install pyinstaller
 python -m PyInstaller --noconfirm --onefile --windowed --add-data "report.js;." --name 採購分析報告產生器 --exclude-module matplotlib --exclude-module scipy --exclude-module IPython app.py
 ```
 
-> 採購資料不放進 repo（`data/`、`output/` 已被忽略）。
+> `data/` 內附採購/出貨明細 Excel（此 repo 為公開，請留意資料內容）；`output/` 為產生的報告，已被忽略。
