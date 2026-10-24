@@ -1,7 +1,7 @@
 """採購分析 (原 n8n 兩個 Code node 的本機版)
 
 用法:
-    python analyze.py                       # 讀 data/TEST REPORT.xlsx, 輸出到 output/
+    python analyze.py                       # 讀 data/採購明細表2025-2026.xlsx, 輸出到 output/
     python analyze.py 其他檔案.xlsx -o 輸出資料夾
 輸出:
     output/analysis.json      (原 Node 1 的輸出)
@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import re
+import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ import pandas as pd
 
 # ===== 設定 =====
 YEARS = [2025, 2026]       # [基準年, 比較年]
+MONTH_FROM, MONTH_TO = 1, 12  # 只分析這個月份區間 (兩個年度都套用)
 VOLUME_METRIC = 'lines'    # 'lines' 行數 | 'amount' 採購未稅金額 | 'qty' 分批採購數量
 MOM_THRESHOLD = 0.3        # 月對月波動率異常門檻
 TOP_SUPPLIERS = 5
@@ -85,7 +87,7 @@ def txt(v, default):
     return s if s else default
 
 
-# ===== 讀取 + 篩選「已確認」=====
+# ===== 讀取 (只留「已確認」, 年度/月份在 analyze 篩選) =====
 def load_records(path):
     if str(path).lower().endswith('.csv'):
         df = pd.read_csv(path, dtype=str, encoding='utf-8-sig').astype(object)
@@ -96,16 +98,16 @@ def load_records(path):
     for r in df.to_dict('records'):
         if str(r.get('狀態') or '').strip() != '已確認':
             continue
-        pd_ = parse_date(r.get('採購日期'))
-        if pd_ is None:
-            continue
-        d = datetime.fromtimestamp(pd_ * 86400, tz=timezone.utc)
-        if d.year not in YEARS:
-            continue
+        d = parse_date(r.get('採購日期'))
+        d = datetime.fromtimestamp(d * 86400, tz=timezone.utc) if d is not None else None
         std, ven = parse_date(r.get('標準交貨日期')), parse_date(r.get('廠商交貨日期'))
         diff = jround(std - ven) if std is not None and ven is not None else None
-        rec = {
-            'year': d.year, 'month': d.month, 'idx': d.year * 12 + d.month - 1,
+        sd = datetime.fromtimestamp(std * 86400, tz=timezone.utc) if std is not None else None
+        recs.append({
+            'year': d.year if d else None, 'month': d.month if d else None,
+            'idx': d.year * 12 + d.month - 1 if d else None,
+            'sYear': sd.year if sd else None, 'sMonth': sd.month if sd else None,
+            'sIdx': sd.year * 12 + sd.month - 1 if sd else None,
             'cat': (str(r.get('料件編號') or '').strip()[:1].upper() or '?'),
             'supplier': txt(r.get('採購供應商'), '(未知)'),
             'buyer': txt(r.get('採購人員'), '(未知)'),
@@ -115,14 +117,17 @@ def load_records(path):
             'sales': num(r.get('銷售金額(未稅)')),
             'diffDays': diff,
             'onTime': None if diff is None else diff >= 0,
-        }
-        rec['vol'] = rec['cost'] if VOLUME_METRIC == 'amount' else rec['qty'] if VOLUME_METRIC == 'qty' else 1
-        recs.append(rec)
+        })
     return recs
 
 
 # ===== Node 1: 分析 =====
-def analyze(recs):
+def analyze(all_recs):
+    # 下單量/毛利率以採購日期歸屬
+    recs = [r for r in all_recs
+            if r['year'] in YEARS and MONTH_FROM <= r['month'] <= MONTH_TO]
+    for r in recs:
+        r['vol'] = r['cost'] if VOLUME_METRIC == 'amount' else r['qty'] if VOLUME_METRIC == 'qty' else 1
     if not recs:
         return {'error': '沒有符合條件(狀態=已確認且採購日期在指定年度)的資料'}
 
@@ -151,11 +156,15 @@ def analyze(recs):
     for m in range(1, 13):
         a = sum(r['vol'] for r in recs if r['year'] == Y0 and r['month'] == m)
         b = sum(r['vol'] for r in recs if r['year'] == Y1 and r['month'] == m)
-        monthly_volume.append({'month': m, Y0: r2(a), Y1: r2(b), 'yoyPct': pct((b - a) / a) if a > 0 else None})
+        ca = sum(r['cost'] for r in recs if r['year'] == Y0 and r['month'] == m)
+        cb = sum(r['cost'] for r in recs if r['year'] == Y1 and r['month'] == m)
+        monthly_volume.append({'month': m, Y0: r2(a), Y1: r2(b), 'yoyPct': pct((b - a) / a) if a > 0 else None,
+                               f'cost{Y0}': r2(ca), f'cost{Y1}': r2(cb),
+                               'costYoyPct': pct((cb - ca) / ca) if ca > 0 else None})
 
     cat_summary = []
     for cat, arr in group_by(recs, lambda r: r['cat']).items():
-        base = sum(r['vol'] for r in arr if r['year'] == Y0 and r['month'] <= cutoff)
+        base = sum(r['vol'] for r in arr if r['year'] == Y0 and MONTH_FROM <= r['month'] <= cutoff)
         cur = sum(r['vol'] for r in arr if r['year'] == Y1)
         series = mom_list(month_series(arr, lambda r: r['vol']))
         moms = [s['mom'] for s in series if s['mom'] is not None]
@@ -194,7 +203,9 @@ def analyze(recs):
     top_suppliers = [{k: v for k, v in x.items() if k != '_t'} for x in sup_rows[:TOP_SUPPLIERS]]
 
     # --- 2. 採購人員達交率 ---
-    del_recs = [r for r in recs if r['onTime'] is not None]
+    # 以標準交貨日期的年月歸屬 (與採購日期年度無關)
+    del_recs = [r for r in all_recs if r['onTime'] is not None and r['sYear'] in YEARS
+                and MONTH_FROM <= r['sMonth'] <= MONTH_TO]
 
     def rate(arr):
         return sum(1 for r in arr if r['onTime']) / len(arr) if arr else None
@@ -203,8 +214,8 @@ def analyze(recs):
     for buyer, arr in group_by(del_recs, lambda r: r['buyer']).items():
         months = []
         for m in range(1, 13):
-            a = [r for r in arr if r['year'] == Y0 and r['month'] == m]
-            b = [r for r in arr if r['year'] == Y1 and r['month'] == m]
+            a = [r for r in arr if r['sYear'] == Y0 and r['sMonth'] == m]
+            b = [r for r in arr if r['sYear'] == Y1 and r['sMonth'] == m]
             if not a and not b:
                 continue
             ra, rb = rate(a), rate(b)
@@ -213,9 +224,9 @@ def analyze(recs):
                            'deltaPP': r2((rb - ra) * 100) if ra is not None and rb is not None else None})
         delivery_by_buyer.append({'buyer': buyer, 'months': months, 'overallPct': pct(rate(arr)), 'lines': len(arr)})
 
-    del_by_idx = group_by(del_recs, lambda r: r['idx'])
+    del_by_idx = group_by(del_recs, lambda r: r['sIdx'])
     delivery_overall = []
-    for i in all_idx:
+    for i in sorted(del_by_idx):
         arr = del_by_idx.get(i, [])
         if arr:
             delivery_overall.append({'ym': ym_label(i), 'ratePct': pct(rate(arr)), 'lines': len(arr),
@@ -329,8 +340,9 @@ def analyze(recs):
 
     return {
         'generatedAt': datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
-        'filter': {'status': '已確認', 'years': YEARS, 'volumeMetric': VOLUME_METRIC, 'sameCutoffMonth': cutoff},
+        'filter': {'status': '已確認', 'years': YEARS, 'volumeMetric': VOLUME_METRIC, 'sameCutoffMonth': cutoff, 'monthFrom': MONTH_FROM, 'monthTo': MONTH_TO},
         'totalRecords': len(recs),
+        'deliveryRecords': len(del_recs),
         'dim1_orderVolume': {
             'monthlyVolume': monthly_volume,
             'top3CategoryGrowth': top3,
@@ -350,54 +362,7 @@ def analyze(recs):
     }
 
 
-# ===== Node 2: HTML 報告 =====
-def esc(s):
-    s = '' if s is None else str(s)
-    return (s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            .replace('"', '&quot;').replace("'", '&#39;'))
-
-
-def n(v):
-    if v is None:
-        return '—'
-    s = f'{float(v):,.2f}'.rstrip('0').rstrip('.')
-    return '0' if s in ('-0', '') else s
-
-
-def p(v):
-    return '—' if v is None else f'{n(v)}%'
-
-
-def sgn(v, suffix='', good_up=True):
-    if v is None:
-        return '<td class="num muted">—</td>'
-    good, bad = (v > 0, v < 0) if good_up else (v < 0, v > 0)
-    cls = 'pos' if good else 'neg' if bad else ''
-    return f'<td class="num {cls}">{"+" if v > 0 else ""}{n(v)}{suffix}</td>'
-
-
-def bar(v, mx, cls=''):
-    w = max(2, min(100, v / mx * 100)) if mx > 0 and v else 0
-    return f'<div class="bar {cls}"><i style="width:{round(w, 2)}%"></i></div>'
-
-
-def table(head, body, cls=''):
-    th = ''.join(f'<th>{h}</th>' for h in head)
-    return f'<div class="scroll"><table class="{cls}"><thead><tr>{th}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
-
-
-def tr(cells):
-    return f'<tr>{"".join(cells)}</tr>'
-
-
-def td(v, cls=''):
-    return f'<td class="{cls}">{v}</td>'
-
-
-def empty(msg):
-    return f'<p class="muted">{msg}</p>'
-
-
+# ===== Node 2: HTML 報告 (資料內嵌, 由 report.js 在瀏覽器端依選項即時重算) =====
 CSS = """
 :root{--bg:#f6f7f9;--card:#fff;--text:#1d2330;--muted:#6b7385;--line:#e4e7ee;--accent:#2f5bea;--pos:#0f8a4f;--neg:#d23b3b;--b0:#b8c2dc;--b1:#2f5bea}
 @media(prefers-color-scheme:dark){:root{--bg:#12151c;--card:#1b2030;--text:#e8ebf3;--muted:#98a1b8;--line:#2b3247;--accent:#7b9bff;--pos:#4fd08c;--neg:#ff7a7a;--b0:#46506e;--b1:#7b9bff}}
@@ -421,173 +386,90 @@ details{margin:6px 0;background:var(--card);border:1px solid var(--line);border-
 """
 
 
-def render_html(d):
-    Y0, Y1 = d['filter']['years']
-    V, D, G = d['dim1_orderVolume'], d['dim2_deliveryRate'], d['dim3_grossMargin']
-    metric_name = {'lines': '明細行數', 'amount': '採購未稅金額', 'qty': '分批採購數量'}.get(
-        d['filter']['volumeMetric'], d['filter']['volumeMetric'])
-    cutoff = d['filter']['sameCutoffMonth']
 
-    # KPI
-    vol0 = sum(m[Y0] for m in V['monthlyVolume'] if m['month'] <= cutoff)
-    vol1 = sum(m[Y1] for m in V['monthlyVolume'])
-    ys = {y['year']: y for y in G['yearlySummary']}
-    kpis = [
-        {'l': f'下單量 {Y1} vs {Y0} 同期', 'v': n(vol1),
-         's': f'{"+" if vol1 >= vol0 else ""}{n((vol1 - vol0) / vol0 * 100)}% ({Y0}: {n(vol0)})' if vol0 > 0 else '',
-         'c': 'pos' if vol1 >= vol0 else 'neg'},
-        {'l': f'整體毛利率 {Y1}', 'v': p(ys.get(Y1, {}).get('aggregateMarginPct')),
-         's': f'{Y0}: {p(ys.get(Y0, {}).get("aggregateMarginPct"))}', 'c': ''},
-        {'l': '波動異常類別 (MoM>30%)', 'v': len(V['volatileCategories']),
-         's': '、'.join(V['volatileCategories']) or '無', 'c': 'neg' if V['volatileCategories'] else 'pos'},
-        {'l': '毛利率低於去年同月', 'v': f'{len(G["declineMonths"])} 個月',
-         's': '、'.join(x['ym'] for x in G['declineMonths']) or '無', 'c': 'neg' if G['declineMonths'] else 'pos'},
-    ]
+CSS += """
+th.num{text-align:right}
+.controls{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 16px;margin:14px 0;position:sticky;top:0;z-index:5}
+.controls select{font:inherit;padding:3px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text)}
+"""
 
-    # 1. 下單量
-    max_vol = max([1] + [m[y] for m in V['monthlyVolume'] for y in (Y0, Y1)])
-    monthly_tbl = table(['月份', Y0, '', Y1, '', '年增率'], [
-        tr([td(f'{m["month"]} 月'), td(n(m[Y0]), 'num'), td(bar(m[Y0], max_vol, 'b0')),
-            td(n(m[Y1]), 'num'), td(bar(m[Y1], max_vol, 'b1')), sgn(m['yoyPct'], '%')])
-        for m in V['monthlyVolume'] if m[Y0] or m[Y1]])
 
-    top3_tbl = table(['排名', '類別', f'{Y0} 同期', f'{Y1}', '增加量', '增幅'], [
-        tr([td(i + 1),
-            td(f'<b>{esc(c["category"])}</b>' + (' <span class="tag">新類別</span>' if c['isNewCategory'] else '')),
-            td(n(c['basePeriod']), 'num'), td(n(c['currentPeriod']), 'num'), sgn(c['delta']),
-            '<td class="num muted">—</td>' if c['growthPct'] is None else sgn(c['growthPct'], '%')])
-        for i, c in enumerate(V['top3CategoryGrowth'])])
+def read_js():
+    base = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
+    return (base / 'report.js').read_text(encoding='utf-8')
 
-    vol_rows = sorted(V['categoryVolatility'], key=lambda c: -(c['avgAbsMomPct'] if c['avgAbsMomPct'] is not None else -1))
-    vol_tbl = table(['類別', '平均 |MoM|', '狀態', '超標月份 (MoM)'], [
-        tr([td(f'<b>{esc(c["category"])}</b>'), td(p(c['avgAbsMomPct']), 'num'),
-            td('<span class="tag bad">異常</span>' if c['volatilityFlag'] else '<span class="tag ok">正常</span>'),
-            td('、'.join(f'{esc(s["ym"])} ({"+" if s["momPct"] > 0 else ""}{n(s["momPct"])}%)' for s in c['spikeMonths'])
-               if c['spikeMonths'] else '—', 'small')])
-        for c in vol_rows])
 
-    sup_tbl = table(['供應商', f'{Y0} 下單量', f'{Y0} 佔比', f'{Y1} 下單量', f'{Y1} 佔比', '佔比位移'], [
-        tr([td(f'<b>{esc(s["supplier"])}</b>'), td(n(s[f'vol{Y0}']), 'num'), td(p(s[f'share{Y0}Pct']), 'num'),
-            td(n(s[f'vol{Y1}']), 'num'), td(p(s[f'share{Y1}Pct']), 'num'), sgn(s['shiftPP'], ' pp')])
-        for s in V['topSuppliers']])
+def default_years(recs):
+    ys = sorted({r['year'] for r in recs if r['year']})
+    if len(ys) >= 2:
+        return ys[-2:]
+    return [ys[0] - 1, ys[0]] if ys else list(YEARS)
 
-    # 2. 達交率
-    def rate_cls(r):
-        return '' if r is None else 'pos' if r >= 90 else 'neg' if r < 70 else ''
 
-    deliv_tbl = table(['月份', '達交率', '', '明細數', '不達交'], [
-        tr([td(esc(m['ym'])), td(p(m['ratePct']), f'num {rate_cls(m["ratePct"])}'),
-            td(bar(m['ratePct'], 100, 'bneg' if m['ratePct'] < 70 else 'b1')),
-            td(n(m['lines']), 'num'), td(n(m['late']), 'num')])
-        for m in D['overallByMonth']])
-    buyer_html = ''.join(
-        f'<details><summary><b>{esc(b["buyer"])}</b> <span class="muted">整體達交率 {p(b["overallPct"])} · {n(b["lines"])} 筆</span></summary>'
-        + table(['月份', f'{Y0} 達交率', f'{Y0} 筆數', f'{Y1} 達交率', f'{Y1} 筆數', '變化'], [
-            tr([td(f'{m["month"]} 月'), td(p(m[f'rate{Y0}Pct']), f'num {rate_cls(m[f"rate{Y0}Pct"])}'),
-                td(n(m[f'n{Y0}']), 'num muted'),
-                td(p(m[f'rate{Y1}Pct']), f'num {rate_cls(m[f"rate{Y1}Pct"])}'),
-                td(n(m[f'n{Y1}']), 'num muted'), sgn(m['deltaPP'], ' pp')])
-            for m in b['months']]) + '</details>'
-        for b in sorted(D['byBuyer'], key=lambda b: -b['lines']))
+def render_html(recs, defaults, generated_at):
+    tabs = {k: {} for k in ('cat', 'sup', 'buy', 'name')}
 
-    # 3. 毛利率
-    yoy_tbl = table(['月份', f'{Y0} 毛利率', f'{Y1} 毛利率', '變化'], [
-        tr([td(f'{m["month"]} 月'), td(p(m[f'margin{Y0}Pct']), 'num'), td(p(m[f'margin{Y1}Pct']), 'num'),
-            sgn(m['deltaPP'], ' pp')]) for m in G['yoyByMonth']])
-    sum_tbl = table(['年度', '月數', '月平均毛利率', '整體毛利率', '銷售額(未稅)', '成本'], [
-        tr([td(f'<b>{y["year"]}</b>'), td(y['months'], 'num'), td(p(y['avgMonthlyMarginPct']), 'num'),
-            td(p(y['aggregateMarginPct']), 'num'), td(n(y['sales']), 'num'), td(n(y['cost']), 'num')])
-        for y in G['yearlySummary']])
+    def ix(kind, v):
+        return tabs[kind].setdefault(v, len(tabs[kind]))
 
-    def decline_card(m):
-        items = (table(['品名', '銷售額變化', '成本變化', '毛利變化', '主因'], [
-            tr([td(esc(i['name']), 'wrap'), sgn(i['dSales']), sgn(i['dCost'], '', False), sgn(i['dGrossProfit']),
-                td(f'<span class="tag">{esc(i["driver"])}</span>')]) for i in m['topNegativeItems']])
-                 if m['topNegativeItems'] else empty('沒有毛利為負貢獻的品名'))
-        return (f'<div class="card"><h4>{esc(m["ym"])} <span class="muted">vs {esc(m["comparedWith"])}</span></h4>'
-                f'<p>毛利率 <b>{p(m["marginPct"])}</b>（去年同月 {p(m["prevYearMarginPct"])}，'
-                f'<span class="neg">{n(m["dropPP"])} pp</span>）· 銷售額變化 {n(m["totalSalesChange"])} · '
-                f'成本變化 {n(m["totalCostChange"])}</p>{items}</div>')
+    def cn(x):
+        return int(x) if float(x).is_integer() else x
 
-    decline_html = ''.join(decline_card(m) for m in G['declineMonths']) or empty('沒有毛利率低於去年同月的月份')
-
-    def trend_tbl(rows):
-        return table(['月份', '成本', '數量', '平均單位成本', 'MoM'], [
-            tr([td(esc(t['ym'])), td(n(t['cost']), 'num'), td(n(t['qty']), 'num'), td(n(t['avgUnitCost']), 'num'),
-                sgn(t['unitCostMomPct'], '%', False)]) for t in rows])
-
-    link_html = ''.join(
-        f'<div class="card"><h4>#{i + 1} {esc(x["name"])}</h4>'
-        f'<p>毛利率 <b class="{"neg" if x["marginPct"] < 0 else ""}">{p(x["marginPct"])}</b> · 銷售額 {n(x["sales"])} · '
-        f'成本 {n(x["cost"])} · 類別 {"、".join(esc(c) for c in x["categories"])}</p>'
-        f'<details><summary>此品名每月採購成本</summary>{trend_tbl(x["itemCostTrend"])}</details>'
-        + ''.join(f'<details><summary>類別 {esc(c["category"])} 採購成本趨勢</summary>{trend_tbl(c["trend"])}</details>'
-                  for c in x['categoryCostTrend'])
-        + '</div>'
-        for i, x in enumerate(G['lowestMarginLinkage']))
-
-    kpi_html = ''.join(
-        f'<div class="kpi"><div class="l">{esc(k["l"])}</div><div class="v {k["c"]}">{esc(k["v"])}</div>'
-        f'<div class="s">{esc(k["s"])}</div></div>' for k in kpis)
-
+    rows = [[r['year'] or 0, r['month'] or 0, r['sYear'] or 0, r['sMonth'] or 0,
+             ix('cat', r['cat']), ix('sup', r['supplier']), ix('buy', r['buyer']), ix('name', r['name']),
+             cn(r['qty']), cn(r['cost']), cn(r['sales']), -1 if r['onTime'] is None else int(r['onTime'])]
+            for r in recs]
+    years = sorted({r['year'] for r in recs if r['year']})
+    data = {'generatedAt': generated_at, 'years': years, 'defaults': defaults, 'rows': rows,
+            **{k: list(v) for k, v in tabs.items()}}
+    blob = json.dumps(data, ensure_ascii=False, separators=(',', ':')).replace('</', '<\\/')
     return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>採購分析報告 {Y0}-{Y1}</title>
+<title>採購分析報告</title>
 <style>{CSS}</style></head><body><div class="wrap">
 <h1>採購分析報告</h1>
-<div class="sub">{Y0} vs {Y1} · 只計「{esc(d['filter']['status'])}」· {n(d['totalRecords'])} 筆明細 · 下單量以{esc(metric_name)}計算 · 產生時間 {esc(d['generatedAt'])}</div>
-<div class="kpis">{kpi_html}</div>
-
-<h2>1. 每月下單量</h2>
-<div class="note">增幅採同期比較：{Y0} 年 1~{cutoff} 月 vs {Y1} 年 1~{cutoff} 月。</div>
-<h3>逐月趨勢</h3>{monthly_tbl}
-<h3>增幅最高前三名類別（料件編號第一碼）</h3>{top3_tbl}
-<h3>單量穩定度（月對月波動，平均 |MoM| &gt; 30% 為異常）</h3>{vol_tbl}
-<h3>前五大供應商佔比位移（pp = 百分點）</h3>{sup_tbl}
-
-<h2>2. 採購人員達交率</h2>
-<div class="note">標準交貨日 − 廠商交貨日 ≥ 0 為達交，&lt; 0 為不達交。紅字 &lt;70%，綠字 ≥90%。</div>
-<h3>全體逐月</h3>{deliv_tbl}
-<h3>各採購人員（點開看逐月 {Y0} vs {Y1}）</h3>{buyer_html}
-
-<h2>3. 毛利率</h2>
-<div class="note">毛利率 = (銷售金額(未稅) − 採購未稅金額) ÷ 銷售金額(未稅)。</div>
-<h3>年度比較</h3>{sum_tbl}
-<h3>每月毛利率 {Y0} vs {Y1}</h3>{yoy_tbl}
-<h3>毛利率低於去年同月的月份：品名拆解</h3>{decline_html}
-<h3>毛利率最低品名與採購端成本趨勢</h3>{link_html}
-</div></body></html>"""
+<div class="controls" id="controls"></div>
+<div id="report"></div>
+</div>
+<script id="data" type="application/json">{blob}</script>
+<script>{read_js()}</script></body></html>"""
 
 
-def run(input_path, out_dir, years=None, metric=None, log=print):
+def run(input_path, out_dir, years=None, metric=None, months=None, log=print):
     """讀 Excel/CSV → 分析 → 寫出 html + json, 回傳 html 路徑"""
-    global YEARS, VOLUME_METRIC
-    if years:
-        YEARS = list(years)
+    global YEARS, VOLUME_METRIC, MONTH_FROM, MONTH_TO
     if metric:
         VOLUME_METRIC = metric
+    if months:
+        MONTH_FROM, MONTH_TO = months
+        if not (1 <= MONTH_FROM <= MONTH_TO <= 12):
+            raise ValueError('月份區間必須在 1~12, 且起始月不能大於結束月')
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     log(f'讀取 {input_path} ...')
     recs = load_records(input_path)
-    log(f'符合條件 {len(recs)} 筆, 分析中 ...')
+    YEARS = list(years) if years else default_years(recs)  # 預設: 資料中最近兩年
+    log(f'已確認 {len(recs)} 筆, 分析中 ...')
     result = analyze(recs)
     if 'error' in result:
         raise ValueError(result['error'])
     (out / 'analysis.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
     html_path = out / '採購分析報告.html'
-    html_path.write_text(render_html(result), encoding='utf-8')
+    html_path.write_text(render_html(recs, {'y0': YEARS[0], 'y1': YEARS[1], 'mf': MONTH_FROM, 'mt': MONTH_TO,
+                                                   'metric': VOLUME_METRIC}, result['generatedAt']), encoding='utf-8')
     log(f'完成 → {html_path}')
     return html_path
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('input', nargs='?', default=str(Path(__file__).parent / 'data' / 'TEST REPORT.xlsx'))
+    ap.add_argument('input', nargs='?', default=str(Path(__file__).parent / 'data' / '採購明細表2025-2026.xlsx'))
     ap.add_argument('-o', '--out', default=str(Path(__file__).parent / 'output'))
+    ap.add_argument('--months', nargs=2, type=int, metavar=('起', '迄'), default=None,
+                    help='只分析指定月份區間, 例如 --months 9 10')
     args = ap.parse_args()
 
     try:
-        run(args.input, args.out)
+        run(args.input, args.out, months=args.months)
     except ValueError as e:
         raise SystemExit(str(e))
 

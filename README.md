@@ -29,7 +29,7 @@ python analyze.py "資料.xlsx" -o out  # 命令列版
 ## 打包 exe
 ```bash
 pip install pyinstaller
-python -m PyInstaller --noconfirm --onefile --windowed --name 採購分析報告產生器 --exclude-module matplotlib --exclude-module scipy --exclude-module IPython app.py
+python -m PyInstaller --noconfirm --onefile --windowed --add-data "report.js;." --name 採購分析報告產生器 --exclude-module matplotlib --exclude-module scipy --exclude-module IPython app.py
 ```
 
 > 採購資料不放進 repo（`data/`、`output/` 已被忽略）。
